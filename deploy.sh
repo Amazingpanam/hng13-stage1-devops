@@ -1,118 +1,96 @@
 #!/bin/bash
+set -e  # Exit immediately on error
 
-# ===============================================
-# 🚀 HNG13 DevOps Stage 1 - Automated Deployment Script
-# Author: Panason Shadrach Ngandiya
-# Description: Automates setup, deployment, and configuration
-# of a Dockerized app on a remote Linux server with NGINX reverse proxy.
-# ===============================================
-
-LOG_FILE="deploy_$(date +%Y%m%d_%H%M%S).log"
-exec > >(tee -i $LOG_FILE)
-exec 2>&1
-
-set -e  # Exit immediately if a command exits with a non-zero status
-
-# ========= Function Definitions =========
-
+# === Utility functions ===
 log() {
-    echo -e "\n[INFO] $1"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
 error_exit() {
-    echo -e "\n[ERROR] $1"
-    exit 1
+  echo "❌ ERROR: $1" >&2
+  exit 1
 }
 
-# ========= Collect User Input =========
-echo "🔧 Starting Deployment Setup..."
+# === Variables ===
+TMP_CLONE_DIR="/tmp/hng_deploy_repo"
 
-read -p "Enter Git Repository URL: " REPO_URL
-read -p "Enter Personal Access Token (PAT): " PAT
-read -p "Enter Branch name (default: main): " BRANCH
-BRANCH=${BRANCH:-main}
-
-read -p "Enter remote server username: " SERVER_USER
-read -p "Enter remote server IP: " SERVER_IP
-read -p "Enter SSH key path (e.g. ~/.ssh/id_rsa): " SSH_KEY
-read -p "Enter application container port (e.g. 5000): " APP_PORT
-
-# ========= Clone Repository =========
-log "Cloning repository..."
-if [ -d "./repo" ]; then
-    cd repo
-    git pull origin $BRANCH || error_exit "Failed to pull latest changes."
-else
-    git clone -b $BRANCH https://${PAT}@${REPO_URL#https://} repo || error_exit "Repository clone failed."
-    cd repo
-fi
-
-# ========= Verify Dockerfile =========
-if [ ! -f "Dockerfile" ] && [ ! -f "docker-compose.yml" ]; then
-    error_exit "No Dockerfile or docker-compose.yml found!"
-fi
-log "Repository verified successfully."
-
-# ========= SSH Connection Test =========
-log "Testing SSH connectivity..."
-ssh -i $SSH_KEY -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "echo SSH Connection Successful" || error_exit "SSH connection failed."
-
-# ========= Remote Server Setup =========
-log "Preparing remote environment..."
-ssh -i $SSH_KEY $SERVER_USER@$SERVER_IP <<EOF
-    set -e
-    sudo apt-get update -y
-    sudo apt-get install -y docker.io docker-compose nginx
-    sudo systemctl enable docker nginx
-    sudo systemctl start docker nginx
-    sudo usermod -aG docker $USER || true
-EOF
-
-log "Remote server ready."
-
-# ========= Deploy Dockerized Application =========
-log "Transferring project files..."
-rsync -avz -e "ssh -i $SSH_KEY" ./ $SERVER_USER@$SERVER_IP:/home/$SERVER_USER/app
-
-log "Deploying Docker containers..."
-ssh -i $SSH_KEY $SERVER_USER@$SERVER_IP <<EOF
-    cd /home/$SERVER_USER/app
-    if [ -f "docker-compose.yml" ]; then
-        sudo docker-compose down || true
-        sudo docker-compose up -d --build
-    else
-        APP_NAME=\$(basename \$(pwd))
-        sudo docker stop \$APP_NAME || true
-        sudo docker rm \$APP_NAME || true
-        sudo docker build -t \$APP_NAME .
-        sudo docker run -d -p $APP_PORT:$APP_PORT --name \$APP_NAME \$APP_NAME
-    fi
-EOF
-
-# ========= Configure NGINX Reverse Proxy =========
-log "Configuring NGINX..."
-NGINX_CONF="/etc/nginx/sites-available/app.conf"
-ssh -i $SSH_KEY $SERVER_USER@$SERVER_IP <<EOF
-    sudo bash -c 'cat > $NGINX_CONF' <<EOL
-server {
-    listen 80;
-    server_name _;
-    location / {
-        proxy_pass http://127.0.0.1:$APP_PORT;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
+# === Functions ===
+cleanup_local() {
+  if [ -d "$TMP_CLONE_DIR" ]; then
+    log "Cleaning up existing clone directory..."
+    rm -rf "$TMP_CLONE_DIR" || error_exit "Failed to remove old directory"
+  fi
 }
-EOL
-    sudo ln -sf $NGINX_CONF /etc/nginx/sites-enabled/app.conf
-    sudo nginx -t && sudo systemctl reload nginx
+
+prepare_clone_dir() {
+  log "Preparing local clone dir: $TMP_CLONE_DIR"
+  cleanup_local
+  mkdir -p "$TMP_CLONE_DIR" || error_exit "Failed to create clone directory"
+  log "✅ Local clone directory ready"
+}
+
+clone_or_update_repo() {
+  read -p "Enter GitHub repository URL: " GIT_REPO_URL
+  read -p "Enter Personal Access Token (PAT): " GIT_PAT
+  read -p "Enter branch name (default: main): " BRANCH
+  read -p "Enter remote server IP address: " SERVER_IP
+  read -p "Enter remote username: " SERVER_USER
+  read -p "Enter SSH private key path (e.g., ~/.ssh/id_rsa): " SSH_KEY_PATH
+
+  BRANCH=${BRANCH:-main}
+
+  prepare_clone_dir
+  cd "$TMP_CLONE_DIR" || error_exit "Failed to enter clone directory"
+
+  REPO_NAME=$(basename -s .git "$GIT_REPO_URL")
+
+  log "Cloning repository..."
+  if git clone -b "$BRANCH" "https://${GIT_PAT}@${GIT_REPO_URL#https://}" "$REPO_NAME"; then
+    log "✅ Repository cloned successfully."
+  else
+    error_exit "❌ Failed to clone repository. Check URL or token."
+  fi
+
+  cd "$REPO_NAME" || error_exit "Failed to enter repo directory"
+
+  if [ -f "docker-compose.yml" ] || [ -f "docker-compose.yaml" ] || [ -f "Dockerfile" ]; then
+    log "✅ Repository contains Docker configuration."
+  else
+    error_exit "❌ No Dockerfile or docker-compose.yml found!"
+  fi
+
+  # Save variables globally for later
+  export SERVER_IP SERVER_USER REPO_NAME SSH_KEY_PATH
+}
+
+# === New: Ping connectivity check ===
+check_ping() {
+  log "Pinging ${SERVER_IP}..."
+  if ping -c 2 "$SERVER_IP" >/dev/null 2>&1; then
+    log "✅ Ping successful — server is reachable."
+    return 0
+  else
+    error_exit "❌ Ping failed. Server might be down or unreachable."
+  fi
+}
+
+# === Remote environment setup ===
+prepare_remote_env() {
+  log "Preparing remote environment on ${SERVER_IP}..."
+  ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no "${SERVER_USER}@${SERVER_IP}" <<'EOF'
+set -e
+sudo apt update -y
+sudo apt install -y docker.io docker-compose nginx
+sudo usermod -aG docker $USER || true
+sudo systemctl enable docker nginx || true
+sudo systemctl start docker nginx || true
+echo "✅ Remote environment prepared successfully."
 EOF
+  log "✅ Remote environment setup complete."
+}
 
-# ========= Validate Deployment =========
-log "Validating deployment..."
-ssh -i $SSH_KEY $SERVER_USER@$SERVER_IP "curl -I http://localhost || echo 'Local test failed.'"
+# === Main Execution ===
+clone_or_update_repo
+check_ping && prepare_remote_env
 
-echo "✅ Deployment complete!"
-echo "Visit: http://$SERVER_IP"
+log "🎯 All steps completed successfully!"
